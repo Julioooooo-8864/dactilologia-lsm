@@ -1,0 +1,560 @@
+// ========== SISTEMA DE DACTILOLOGÍA LSM COMPLETO ==========
+
+class DactilologiaSystem {
+    constructor() {
+        // Elementos del DOM
+        this.videoElement = document.getElementById('videoInput');
+        this.canvasElement = document.getElementById('outputCanvas');
+        this.ctx = this.canvasElement.getContext('2d');
+        
+        // Configuración del canvas
+        this.canvasElement.width = 1280;
+        this.canvasElement.height = 720;
+        
+        // Estado del sistema
+        this.datos = {};
+        this.deletreoActual = '';
+        this.letraDetectada = null;
+        this.confianzaActual = 0;
+        this.velocidadMano = 0;
+        
+        // Control de estabilidad
+        this.framesEstables = 0;
+        this.ultimaLetra = null;
+        this.cooldownFrames = 0;
+        this.ultimoCentro = null;
+        
+        // Configuración de detección
+        this.config = {
+            umbralVelocidad: 0.03,
+            umbralConfianza: 0.85,
+            framesParaEstabilidad: 10,
+            cooldownEntreDetecciones: 15,
+            distanciaMaxima: 0.25
+        };
+        
+        // Inicializar
+        this.inicializarMediaPipe();
+        this.cargarDatosGuardados();
+        this.crearGridAbecedario();
+        this.configurarControles();
+    }
+    
+    // ========== INICIALIZAR MEDIAPIPE ==========
+    inicializarMediaPipe() {
+        this.hands = new Hands({
+            locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`;
+            }
+        });
+        
+        this.hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.8,
+            minTrackingConfidence: 0.8
+        });
+        
+        this.hands.onResults((results) => this.procesarResultados(results));
+        
+        // Iniciar cámara
+        this.iniciarCamara();
+    }
+    
+    async iniciarCamara() {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                    width: { ideal: 1280 },
+                    height: { ideal: 720 },
+                    facingMode: 'user'
+                }
+            });
+            
+            this.videoElement.srcObject = stream;
+            await this.videoElement.play();
+            
+            // Iniciar loop de detección
+            this.loopDeteccion();
+            
+            console.log('✅ Cámara iniciada correctamente');
+        } catch (error) {
+            console.error('❌ Error al acceder a la cámara:', error);
+            this.mostrarFeedback('Error: No se pudo acceder a la cámara', 'error');
+        }
+    }
+    
+    async loopDeteccion() {
+        if (this.videoElement.readyState >= 2) {
+            await this.hands.send({ image: this.videoElement });
+        }
+        requestAnimationFrame(() => this.loopDeteccion());
+    }
+    
+    // ========== PROCESAR RESULTADOS DE MEDIAPIPE ==========
+    procesarResultados(results) {
+        // Limpiar canvas y dibujar video
+        this.ctx.save();
+        this.ctx.clearRect(0, 0, this.canvasElement.width, this.canvasElement.height);
+        this.ctx.translate(this.canvasElement.width, 0);
+        this.ctx.scale(-1, 1);
+        this.ctx.drawImage(this.videoElement, 0, 0, this.canvasElement.width, this.canvasElement.height);
+        this.ctx.restore();
+        
+        // Dibujar interfaz base
+        this.dibujarInterfazBase();
+        
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const landmarks = results.multiHandLandmarks[0];
+            
+            // Dibujar mano
+            this.dibujarMano(landmarks);
+            
+            // Procesar landmarks
+            const firma = this.extraerFirma(landmarks);
+            
+            // Calcular velocidad de la mano
+            const centro = [
+                landmarks[9].x,
+                landmarks[9].y,
+                landmarks[9].z
+            ];
+            
+            if (this.ultimoCentro) {
+                const dx = centro[0] - this.ultimoCentro[0];
+                const dy = centro[1] - this.ultimoCentro[1];
+                const dz = centro[2] - this.ultimoCentro[2];
+                this.velocidadMano = Math.sqrt(dx*dx + dy*dy + dz*dz);
+            }
+            this.ultimoCentro = centro;
+            
+            // Predecir letra
+            this.predecirLetra(firma);
+        } else {
+            // Reiniciar si no hay mano
+            this.framesEstables = 0;
+            this.ultimaLetra = null;
+        }
+        
+        // Dibujar paneles de información
+        this.dibujarPanelLetra();
+        this.dibujarPanelDeletreo();
+        this.dibujarIndicadorEstabilidad();
+    }
+    
+    // ========== DIBUJAR INTERFAZ ==========
+    dibujarInterfazBase() {
+        const ctx = this.ctx;
+        const w = this.canvasElement.width;
+        
+        // Header
+        ctx.fillStyle = 'rgba(10, 10, 10, 0.9)';
+        ctx.fillRect(0, 0, w, 60);
+        ctx.fillStyle = '#00ff00';
+        ctx.font = 'bold 18px Arial';
+        ctx.fillText('🖐️ DACTILOLOGÍA LSM', 20, 40);
+        
+        // Indicador de modo grabación
+        if (this.modoGrabacion) {
+            ctx.fillStyle = '#ff0000';
+            ctx.font = 'bold 16px Arial';
+            ctx.fillText(`🔴 GRABANDO: ${this.modoGrabacion}`, w - 250, 40);
+        }
+    }
+    
+    dibujarMano(landmarks) {
+        // Dibujar conexiones
+        drawConnectors(this.ctx, landmarks, this.hands.HAND_CONNECTIONS, {
+            color: '#00ff00',
+            lineWidth: 2
+        });
+        
+        // Dibujar puntos
+        drawLandmarks(this.ctx, landmarks, {
+            color: '#ffffff',
+            lineWidth: 1,
+            radius: 3
+        });
+        
+        // Destacar puntas de dedos (importantes para dactilología)
+        const fingerTips = [4, 8, 12, 16, 20];
+        fingerTips.forEach(tip => {
+            const lm = landmarks[tip];
+            const x = this.canvasElement.width - (lm.x * this.canvasElement.width);
+            const y = lm.y * this.canvasElement.height;
+            
+            this.ctx.beginPath();
+            this.ctx.arc(x, y, 6, 0, 2 * Math.PI);
+            this.ctx.fillStyle = '#ff0000';
+            this.ctx.fill();
+            this.ctx.strokeStyle = '#ffffff';
+            this.ctx.lineWidth = 2;
+            this.ctx.stroke();
+        });
+    }
+    
+    dibujarPanelLetra() {
+        if (!this.letraDetectada) return;
+        
+        const ctx = this.ctx;
+        const w = this.canvasElement.width;
+        const panelX = w - 280;
+        const panelY = 80;
+        
+        // Panel
+        ctx.fillStyle = 'rgba(20, 20, 20, 0.9)';
+        ctx.fillRect(panelX, panelY, 260, 180);
+        ctx.strokeStyle = this.confianzaActual > 0.9 ? '#00ff00' : '#ffaa00';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(panelX, panelY, 260, 180);
+        
+        // Letra grande
+        ctx.fillStyle = this.confianzaActual > 0.9 ? '#00ff00' : '#ffaa00';
+        ctx.font = 'bold 100px Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText(this.letraDetectada, panelX + 130, panelY + 120);
+        
+        // Confianza
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '14px Arial';
+        ctx.fillText(`Confianza: ${(this.confianzaActual * 100).toFixed(1)}%`, panelX + 130, panelY + 150);
+    }
+    
+    dibujarPanelDeletreo() {
+        const ctx = this.ctx;
+        const h = this.canvasElement.height;
+        
+        // Panel inferior
+        ctx.fillStyle = 'rgba(10, 10, 10, 0.9)';
+        ctx.fillRect(0, h - 100, this.canvasElement.width, 100);
+        ctx.strokeStyle = '#00ff00';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(0, h - 100, this.canvasElement.width, 100);
+        
+        // Deletreo actual
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 36px monospace';
+        ctx.textAlign = 'left';
+        const texto = this.deletreoActual || 'Muestra una letra...';
+        ctx.fillText(texto, 30, h - 40);
+        
+        // Contador de letras
+        ctx.fillStyle = '#888';
+        ctx.font = '14px Arial';
+        ctx.textAlign = 'right';
+        ctx.fillText(`${this.deletreoActual.length} letras`, this.canvasElement.width - 30, h - 60);
+    }
+    
+    dibujarIndicadorEstabilidad() {
+        const ctx = this.ctx;
+        const w = this.canvasElement.width;
+        
+        // Indicador de estabilidad
+        const estable = this.velocidadMano < this.config.umbralVelocidad;
+        const x = 20;
+        const y = 80;
+        
+        ctx.fillStyle = 'rgba(20, 20, 20, 0.9)';
+        ctx.fillRect(x, y, 200, 60);
+        ctx.strokeStyle = estable ? '#00ff00' : '#ff0000';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x, y, 200, 60);
+        
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '14px Arial';
+        ctx.fillText(estable ? '✅ MANO ESTABLE' : '⚠️ EN MOVIMIENTO', x + 15, y + 25);
+        ctx.fillText(`Velocidad: ${this.velocidadMano.toFixed(3)}`, x + 15, y + 45);
+    }
+    
+    // ========== EXTRACCIÓN DE CARACTERÍSTICAS ==========
+    extraerFirma(landmarks) {
+        // Convertir landmarks a coordenadas
+        const coords = landmarks.map(lm => [lm.x, lm.y, lm.z]);
+        
+        // Centrar en la palma (punto 9)
+        const centroPalma = coords[9];
+        const coordsCentradas = coords.map(coord => [
+            coord[0] - centroPalma[0],
+            coord[1] - centroPalma[1],
+            coord[2] - centroPalma[2]
+        ]);
+        
+        // Aplanar y normalizar
+        const flat = coordsCentradas.flat();
+        const norma = Math.sqrt(flat.reduce((sum, val) => sum + val * val, 0));
+        const firma = norma > 0 ? flat.map(v => v / norma) : flat;
+        
+        // Agregar características adicionales de dedos
+        const fingerFeatures = this.extraerCaracteristicasDedos(landmarks);
+        
+        return [...firma, ...fingerFeatures];
+    }
+    
+    extraerCaracteristicasDedos(landmarks) {
+        const features = [];
+        
+        // Extensiones de dedos (distancia punta-base)
+        const fingerTips = [4, 8, 12, 16, 20];
+        const fingerBases = [2, 5, 9, 13, 17];
+        
+        for (let i = 0; i < fingerTips.length; i++) {
+            const tip = landmarks[fingerTips[i]];
+            const base = landmarks[fingerBases[i]];
+            const extension = Math.sqrt(
+                Math.pow(tip.x - base.x, 2) +
+                Math.pow(tip.y - base.y, 2) +
+                Math.pow(tip.z - base.z, 2)
+            );
+            features.push(extension);
+        }
+        
+        // Distancias entre dedos (para V, W, etc.)
+        const indexTip = landmarks[8];
+        const middleTip = landmarks[12];
+        const ringTip = landmarks[16];
+        const pinkyTip = landmarks[20];
+        
+        features.push(
+            Math.sqrt(Math.pow(indexTip.x - middleTip.x, 2) + Math.pow(indexTip.y - middleTip.y, 2)),
+            Math.sqrt(Math.pow(middleTip.x - ringTip.x, 2) + Math.pow(middleTip.y - ringTip.y, 2)),
+            Math.sqrt(Math.pow(ringTip.x - pinkyTip.x, 2) + Math.pow(ringTip.y - pinkyTip.y, 2))
+        );
+        
+        return features;
+    }
+    
+    // ========== PREDICCIÓN DE LETRA ==========
+    predecirLetra(firma) {
+        // Verificar cooldown
+        if (this.cooldownFrames > 0) {
+            this.cooldownFrames--;
+            return;
+        }
+        
+        // Verificar estabilidad
+        if (this.velocidadMano >= this.config.umbralVelocidad) {
+            this.framesEstables = 0;
+            this.ultimaLetra = null;
+            return;
+        }
+        
+        // Buscar la letra más similar
+        let mejorLetra = null;
+        let mejorConfianza = 0;
+        let mejorDistancia = Infinity;
+        
+        for (const [letra, ejemplos] of Object.entries(this.datos)) {
+            for (const ejemplo of ejemplos) {
+                const distancia = this.calcularDistanciaCoseno(firma, ejemplo.firma);
+                
+                if (distancia < this.config.distanciaMaxima && distancia < mejorDistancia) {
+                    const confianza = 1 - distancia;
+                    if (confianza > mejorConfianza) {
+                        mejorConfianza = confianza;
+                        mejorDistancia = distancia;
+                        mejorLetra = letra;
+                    }
+                }
+            }
+        }
+        
+        // Verificar estabilidad de la detección
+        if (mejorLetra && mejorConfianza >= this.config.umbralConfianza) {
+            if (mejorLetra === this.ultimaLetra) {
+                this.framesEstables++;
+                
+                if (this.framesEstables >= this.config.framesParaEstabilidad) {
+                    // Letra confirmada
+                    this.letraDetectada = mejorLetra;
+                    this.confianzaActual = mejorConfianza;
+                    
+                    // Agregar al deletreo
+                    if (this.deletreoActual.length === 0 || 
+                        this.deletreoActual[this.deletreoActual.length - 1] !== mejorLetra) {
+                        this.deletreoActual += mejorLetra;
+                    }
+                    
+                    // Activar cooldown
+                    this.cooldownFrames = this.config.cooldownEntreDetecciones;
+                    this.framesEstables = 0;
+                }
+            } else {
+                this.framesEstables = 1;
+                this.ultimaLetra = mejorLetra;
+            }
+        } else {
+            this.framesEstables = 0;
+            this.ultimaLetra = null;
+        }
+    }
+    
+    calcularDistanciaCoseno(a, b) {
+        let dotProduct = 0;
+        let normA = 0;
+        let normB = 0;
+        
+        for (let i = 0; i < a.length; i++) {
+            dotProduct += a[i] * b[i];
+            normA += a[i] * a[i];
+            normB += b[i] * b[i];
+        }
+        
+        normA = Math.sqrt(normA);
+        normB = Math.sqrt(normB);
+        
+        if (normA === 0 || normB === 0) return 1;
+        
+        const similarity = dotProduct / (normA * normB);
+        return 1 - similarity;
+    }
+    
+    // ========== GESTIÓN DE DATOS ==========
+    cargarDatosGuardados() {
+        const guardado = localStorage.getItem('lsm_dactilologia_datos');
+        if (guardado) {
+            try {
+                this.datos = JSON.parse(guardado);
+                console.log(`📚 ${Object.keys(this.datos).length} letras cargadas`);
+            } catch (e) {
+                console.error('Error al cargar datos:', e);
+                this.datos = {};
+            }
+        }
+    }
+    
+    guardarDatos() {
+        localStorage.setItem('lsm_dactilologia_datos', JSON.stringify(this.datos));
+        console.log('💾 Datos guardados correctamente');
+    }
+    
+    grabarLetra(letra) {
+        // Verificar que sea una letra válida
+        if (!/^[A-ZÑ]$/.test(letra)) {
+            this.mostrarFeedback('Letra no válida', 'error');
+            return;
+        }
+        
+        // Activar modo grabación
+        this.modoGrabacion = letra;
+        this.framesGrabados = 0;
+        this.ejemplosGrabados = [];
+        
+        // Inicializar array si no existe
+        if (!this.datos[letra]) {
+            this.datos[letra] = [];
+        }
+        
+        this.mostrarFeedback(`Grabando letra: ${letra}`, 'success');
+        
+        // Grabar durante 2 segundos
+        const intervaloGrabacion = setInterval(() => {
+            if (this.videoElement.readyState >= 2) {
+                this.hands.send({ image: this.videoElement }).then(results => {
+                    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                        const landmarks = results.multiHandLandmarks[0];
+                        const firma = this.extraerFirma(landmarks);
+                        
+                        this.ejemplosGrabados.push({
+                            firma: firma,
+                            timestamp: Date.now()
+                        });
+                        
+                        this.framesGrabados++;
+                    }
+                });
+            }
+        }, 100);
+        
+        // Detener grabación después de 2 segundos
+        setTimeout(() => {
+            clearInterval(intervaloGrabacion);
+            
+            // Agregar ejemplos a los datos
+            this.datos[letra].push(...this.ejemplosGrabados);
+            
+            // Guardar
+            this.guardarDatos();
+            
+            // Actualizar UI
+            this.actualizarGrid();
+            
+            // Salir de modo grabación
+            this.modoGrabacion = null;
+            this.mostrarFeedback(`✅ Letra ${letra} grabada (${this.ejemplosGrabados.length} ejemplos)`, 'success');
+            
+            console.log(`✅ Letra ${letra}: ${this.ejemplosGrabados.length} ejemplos capturados`);
+        }, 2000);
+    }
+    
+    // ========== INTERFAZ DE USUARIO ==========
+    crearGridAbecedario() {
+        const grid = document.getElementById('abecedarioGrid');
+        const abecedario = 'ABCDEFGHIJKLMNÑOPQRSTUVWXYZ';
+        
+        grid.innerHTML = '';
+        
+        abecedario.split('').forEach(letra => {
+            const btn = document.createElement('div');
+            btn.className = 'letra-btn';
+            btn.textContent = letra;
+            btn.title = `Click o presiona ${letra} para grabar`;
+            
+            if (this.datos[letra] && this.datos[letra].length > 0) {
+                btn.classList.add('trained');
+            }
+            
+            btn.addEventListener('click', () => this.grabarLetra(letra));
+            
+            grid.appendChild(btn);
+        });
+    }
+    
+    actualizarGrid() {
+        const buttons = document.querySelectorAll('.letra-btn');
+        buttons.forEach(btn => {
+            const letra = btn.textContent;
+            if (this.datos[letra] && this.datos[letra].length > 0) {
+                btn.classList.add('trained');
+            } else {
+                btn.classList.remove('trained');
+            }
+        });
+    }
+    
+    mostrarFeedback(mensaje, tipo = 'success') {
+        const toast = document.createElement('div');
+        toast.className = `feedback-toast ${tipo}`;
+        toast.textContent = mensaje;
+        document.body.appendChild(toast);
+        
+        setTimeout(() => {
+            toast.remove();
+        }, 2000);
+    }
+    
+    configurarControles() {
+        document.addEventListener('keydown', (e) => {
+            const key = e.key.toUpperCase();
+            
+            if (e.key === 'Escape') {
+                this.guardarDatos();
+                this.mostrarFeedback('💾 Datos guardados', 'success');
+            } 
+            else if (e.key === 'Backspace') {
+                this.deletreoActual = this.deletreoActual.slice(0, -1);
+            }
+            else if (e.key === ' ') {
+                this.deletreoActual += ' ';
+            }
+            else if (/^[A-ZÑ]$/.test(key) && !e.ctrlKey && !e.metaKey) {
+                this.grabarLetra(key);
+            }
+        });
+    }
+}
+
+// ========== INICIAR SISTEMA ==========
+document.addEventListener('DOMContentLoaded', () => {
+    console.log('🖐️ Iniciando Sistema de Dactilología LSM...');
+    window.dactilologiaSystem = new DactilologiaSystem();
+});
